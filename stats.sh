@@ -15,6 +15,7 @@ CYAN=$'\033[36m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
 RED=$'\033[31m'
+MAGENTA=$'\033[35m'
 RESET=$'\033[0m'
 
 # Temp file for per-core CPU data (collected in background)
@@ -40,9 +41,16 @@ if [[ ! -x "$CORE_BIN" ]]; then
     echo "Done."
 fi
 
-BOX_W=44  # inner width between │ markers
-W=20      # main bar character width
-CORE_W=10 # per-core bar width
+# Detect CPU topology once
+NUM_E_CORES=4   # M2 Pro: cores 0-3 are efficiency
+NUM_TOTAL_CORES=$(sysctl -n hw.logicalcpu)
+NUM_P_CORES=$((NUM_TOTAL_CORES - NUM_E_CORES))
+GPU_NUM_CORES=$(ioreg -r -c AGXAccelerator 2>/dev/null | grep -o '"num_cores"=[0-9]*' | grep -o '[0-9]*$' || echo "?")
+CHIP_NAME=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+
+BOX_W=56  # inner width between │ markers
+W=26      # main bar character width
+CORE_W=12 # per-core bar width
 
 # Strip ANSI escapes and count visible width
 vislen() {
@@ -65,6 +73,12 @@ empty_row() {
     printf "%s│%s%*s%s│%s\n" "$BOLD" "$RESET" "$BOX_W" "" "$BOLD" "$RESET"
 }
 
+divider_row() {
+    local line
+    line=$(printf '┈%.0s' $(seq 1 $BOX_W))
+    printf "%s│%s%s%s%s│%s\n" "$BOLD" "$RESET" "$DIM" "$line" "$BOLD" "$RESET"
+}
+
 # Bar: outputs colored bar string of given width
 make_bar() {
     local val=$1 max=$2 width=$3
@@ -77,9 +91,10 @@ make_bar() {
     elif (( pct > 50 )); then color="$YELLOW"
     fi
     BAR_STR="$color"
-    for ((i=0; i<filled; i++)); do BAR_STR+='█'; done
+    local j
+    for ((j=0; j<filled; j++)); do BAR_STR+='█'; done
     BAR_STR+="$DIM"
-    for ((i=0; i<empty; i++)); do BAR_STR+='░'; done
+    for ((j=0; j<empty; j++)); do BAR_STR+='░'; done
     BAR_STR+="$RESET"
 }
 
@@ -89,6 +104,18 @@ temp_col() {
     if (( temp >= 80 )); then echo "$RED"
     elif (( temp >= 60 )); then echo "$YELLOW"
     else echo "$GREEN"
+    fi
+}
+
+# Format bytes to human readable
+fmt_bytes() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        awk "BEGIN { printf \"%.1fG\", $bytes / 1073741824 }"
+    elif (( bytes >= 1048576 )); then
+        awk "BEGIN { printf \"%.0fM\", $bytes / 1048576 }"
+    else
+        awk "BEGIN { printf \"%.0fK\", $bytes / 1024 }"
     fi
 }
 
@@ -112,7 +139,7 @@ while true; do
     cpu_idle=$(echo "$cpu_line" | awk -F'[ %]+' '{print $7}')
     cpu_used=$(awk "BEGIN { printf \"%.1f\", $cpu_user + $cpu_sys }")
 
-    # GPU
+    # GPU utilization
     gpu_raw=$(ioreg -r -c AGXAccelerator 2>/dev/null || true)
     gpu_util=$(echo "$gpu_raw" | grep -o '"Device Utilization %"=[0-9]*' | grep -o '[0-9]*$')
     gpu_render=$(echo "$gpu_raw" | grep -o '"Renderer Utilization %"=[0-9]*' | grep -o '[0-9]*$')
@@ -121,7 +148,11 @@ while true; do
     gpu_render=${gpu_render:-0}
     gpu_tiler=${gpu_tiler:-0}
 
-    # Memory
+    # GPU memory from PerformanceStatistics
+    gpu_mem_alloc=$(echo "$gpu_raw" | grep -o '"Alloc system memory"=[0-9]*' | grep -o '[0-9]*$' || echo "0")
+    gpu_mem_inuse=$(echo "$gpu_raw" | grep -o '"In use system memory"=[0-9]*' | head -1 | grep -o '[0-9]*$' || echo "0")
+
+    # System Memory
     mem_line=$(top -l 1 -s 0 -n 0 2>/dev/null | grep "PhysMem")
     mem_used_raw=$(echo "$mem_line" | awk '{print $2}')
     mem_used_num=${mem_used_raw%%[A-Za-z]*}
@@ -145,13 +176,16 @@ while true; do
         gpu_temp=$(echo "$temp_out" | grep "GPU_TEMP_AVG" | cut -d= -f2)
     fi
 
-    # Wait for per-core data
+    # Wait for per-core data and parse
     wait "$core_pid" 2>/dev/null || true
-    core_pcts=()
+
+    # Read core data into indexed variables (robust for bash 3.2+)
     num_cores=0
     while IFS='=' read -r key val; do
         if [[ "$key" == CORE* ]]; then
-            core_pcts+=("$val")
+            # Extract core number from key like CORE0, CORE1, etc.
+            core_idx=${key#CORE}
+            eval "core_val_${core_idx}=\"${val}\""
             num_cores=$((num_cores + 1))
         fi
     done < "$CORE_TMP"
@@ -162,64 +196,93 @@ while true; do
     border=$(printf '─%.0s' $(seq 1 $BOX_W))
     echo "${BOLD}╭${border}╮${RESET}"
 
+    # Header
+    row "  ${BOLD}${CHIP_NAME}${RESET}  ${DIM}${NUM_E_CORES}E + ${NUM_P_CORES}P cores  GPU ${GPU_NUM_CORES} cores${RESET}"
+    divider_row
+
     # CPU aggregate
     make_bar "$cpu_used" 100 $W
     cpu_pct=$(printf "%5.1f%%" "$cpu_used")
-    row "  ${BOLD}${CYAN}CPU${RESET}     ${BAR_STR}  ${cpu_pct}"
+    row "  ${BOLD}${CYAN}CPU${RESET}      ${BAR_STR}  ${cpu_pct}"
     row "  ${DIM}user ${cpu_user}%  sys ${cpu_sys}%  idle ${cpu_idle}%${RESET}"
 
-    # Per-core bars (2 per row, htop-style left/right split)
+    # Per-core bars: E-cores and P-cores side by side
+    # Left column: E-cores (0..NUM_E_CORES-1), Right column: P-cores (NUM_E_CORES..NUM_TOTAL_CORES-1)
     if (( num_cores > 0 )); then
-        half=$(( (num_cores + 1) / 2 ))
-        for ((i=0; i<half; i++)); do
-            left=$i
-            right=$((i + half))
+        max_rows=$NUM_P_CORES
+        if (( NUM_E_CORES > NUM_P_CORES )); then
+            max_rows=$NUM_E_CORES
+        fi
 
-            left_val="${core_pcts[$left]}"
-            make_bar "$left_val" 100 $CORE_W
-            left_bar="$BAR_STR"
-            left_pct=$(printf "%3.0f%%" "$left_val")
-            left_label=$(printf "%2d" "$left")
+        for ((r=0; r<max_rows; r++)); do
+            left_idx=$r
+            right_idx=$((r + NUM_E_CORES))
 
-            if (( right < num_cores )); then
-                right_val="${core_pcts[$right]}"
+            # Left column (E-core)
+            if (( left_idx < NUM_E_CORES )); then
+                left_val="0.0"
+                eval "left_val=\${core_val_${left_idx}:-0.0}"
+                make_bar "$left_val" 100 $CORE_W
+                left_bar="$BAR_STR"
+                left_pct=$(printf "%3.0f%%" "$left_val")
+                left_str="  ${DIM}E${RESET}$(printf '%d' $left_idx) ${left_bar} ${left_pct}"
+            else
+                # Empty left column
+                left_str=$(printf "  %*s" 19 "")
+            fi
+
+            # Right column (P-core)
+            if (( right_idx < NUM_TOTAL_CORES )); then
+                right_val="0.0"
+                eval "right_val=\${core_val_${right_idx}:-0.0}"
                 make_bar "$right_val" 100 $CORE_W
                 right_bar="$BAR_STR"
                 right_pct=$(printf "%3.0f%%" "$right_val")
-                right_label=$(printf "%2d" "$right")
-                row "  ${left_label} ${left_bar} ${left_pct}   ${right_label} ${right_bar} ${right_pct}"
+                right_str="  ${BOLD}P${RESET}$(printf '%d' $right_idx) ${right_bar} ${right_pct}"
             else
-                row "  ${left_label} ${left_bar} ${left_pct}"
+                right_str=""
             fi
+
+            row "${left_str}${right_str}"
         done
     fi
-    empty_row
+    divider_row
 
-    # GPU metrics (Device as main, Render + Tiler as sub-metrics)
+    # GPU metrics
     make_bar "$gpu_util" 100 $W
     gpu_pct=$(printf "%3s%%" "$gpu_util")
-    row "  ${BOLD}${CYAN}GPU${RESET}     ${BAR_STR}  ${gpu_pct}"
+    row "  ${BOLD}${CYAN}GPU${RESET}      ${BAR_STR}  ${gpu_pct}"
     make_bar "$gpu_render" 100 $W
     render_pct=$(printf "%3s%%" "$gpu_render")
-    row "  ${DIM}Render${RESET}  ${BAR_STR}  ${render_pct}"
+    row "  ${DIM}Render${RESET}   ${BAR_STR}  ${render_pct}"
     make_bar "$gpu_tiler" 100 $W
     tiler_pct=$(printf "%3s%%" "$gpu_tiler")
-    row "  ${DIM}Tiler${RESET}   ${BAR_STR}  ${tiler_pct}"
-    empty_row
+    row "  ${DIM}Tiler${RESET}    ${BAR_STR}  ${tiler_pct}"
 
-    # Memory
+    # GPU VRAM
+    if [[ "$gpu_mem_alloc" != "0" ]]; then
+        alloc_str=$(fmt_bytes "$gpu_mem_alloc")
+        inuse_str=$(fmt_bytes "$gpu_mem_inuse")
+        row "  ${DIM}VRAM  alloc: ${RESET}${alloc_str}${DIM}  in use: ${RESET}${inuse_str}"
+    fi
+    divider_row
+
+    # System Memory
     mem_pct=$(awk "BEGIN { printf \"%.1f\", ($mem_used_gb / $MEM_TOTAL_GB) * 100 }")
     make_bar "$mem_pct" 100 $W
-    row "  ${BOLD}${CYAN}MEM${RESET}     ${BAR_STR}  ${mem_used_gb}G/${MEM_TOTAL_GB}G"
+    mem_pct_str=$(printf "%3.0f%%" "$mem_pct")
+    row "  ${BOLD}${CYAN}MEM${RESET}      ${BAR_STR}  ${mem_used_gb}G/${MEM_TOTAL_GB}G"
 
     if [[ -n "$swap_used" ]] && awk "BEGIN { exit ($swap_used > 0.01) ? 0 : 1 }" 2>/dev/null; then
         swap_gb=$(awk "BEGIN { printf \"%.1f\", $swap_used / 1024 }")
         swap_total_gb=$(awk "BEGIN { printf \"%.1f\", $swap_total / 1024 }")
-        row "  ${DIM}swap ${swap_gb}G / ${swap_total_gb}G${RESET}"
+        swap_pct=$(awk "BEGIN { if ($swap_total > 0) printf \"%.0f\", ($swap_used / $swap_total) * 100; else print 0 }")
+        make_bar "$swap_pct" 100 $W
+        row "  ${DIM}Swap${RESET}     ${BAR_STR}  ${swap_gb}G/${swap_total_gb}G"
     else
         row "  ${DIM}swap: none${RESET}"
     fi
-    empty_row
+    divider_row
 
     # Temps
     cpu_t_str="${DIM}CPU: --°C${RESET}"
@@ -230,7 +293,7 @@ while true; do
     if [[ -n "$gpu_temp" ]]; then
         gpu_t_str="$(temp_col "$gpu_temp")GPU: ${gpu_temp}°C${RESET}"
     fi
-    row "  ${BOLD}${CYAN}TEMP${RESET}    ${cpu_t_str}  ${gpu_t_str}"
+    row "  ${BOLD}${CYAN}TEMP${RESET}     ${cpu_t_str}    ${gpu_t_str}"
 
     echo "${BOLD}╰${border}╯${RESET}"
     printf "  %sRefreshing every %ss · Ctrl+C to exit%s\n" "$DIM" "$INTERVAL" "$RESET"
