@@ -1,0 +1,6 @@
+# Compiled Swift binaries
+smc_temp
+cpu_cores
+
+# macOS
+.DS_Store
